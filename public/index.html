@@ -65,6 +65,7 @@
             <div class="stage-nick" id="stage-nick"></div>
             <div class="stage-timer" id="stage-timer">00:00</div>
             <div class="stage-countdown hidden" id="stage-countdown"></div>
+            <div class="stage-quota hidden" id="stage-quota"></div>
             <div class="stage-actions" id="stage-actions-host">
               <button class="btn btn-danger btn-lg" id="btn-end" type="button">结束发言</button>
             </div>
@@ -83,8 +84,21 @@
               <option value="">不限时</option>
             </select>
           </label>
+          <label class="duration-picker host-only" title="每人本周期的累计发言配额（余额耗尽自动结束发言并禁止再排队）">
+            配额
+            <select id="quota-duration"></select>
+          </label>
+          <button class="btn btn-secondary btn-mini host-only" id="btn-quota-reset" type="button"
+                  title="开启发言配额：本周期内每人累计发言时长不得超过所选额度">⏱ 开启发言配额</button>
           <button class="btn btn-primary btn-mini host-only rollcall-start-btn" id="btn-rollcall-start"
                   type="button" title="按队列顺序逐一点名，每人 20 秒确认">📢 点名接力</button>
+        </div>
+
+        <!-- 累计发言配额：周期标识、每人额度与我的实时余额 -->
+        <div class="quota-bar" id="quota-bar" hidden>
+          <span class="quota-tag">发言配额</span>
+          <span class="quota-bar-text" id="quota-bar-text"></span>
+          <span class="quota-mine" id="quota-mine"></span>
         </div>
 
         <!-- 队首点名接力：倒计时、当前对象与本人操作 -->

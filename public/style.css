@@ -245,6 +245,7 @@ input[type="text"]:focus {
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .count {
@@ -358,6 +359,95 @@ input[type="text"]:focus {
 .duration-picker select:focus {
   border-color: var(--primary);
 }
+
+/* ===== 累计发言配额 ===== */
+.quota-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.08);
+  font-size: 15px;
+  animation: pop 0.2s ease;
+}
+
+.quota-tag {
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--primary);
+  color: #fff;
+  padding: 2px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.quota-bar-text { color: var(--text); }
+
+.quota-period {
+  color: var(--text-dim);
+  font-size: 13px;
+  font-family: ui-monospace, monospace;
+}
+
+.quota-mine {
+  margin-left: auto;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.quota-exhausted { color: #fca5a5; }
+
+.quota-mini-tag {
+  font-size: 12px;
+  background: rgba(59, 130, 246, 0.16);
+  color: #93c5fd;
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  padding: 1px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-mini-tag.quota-exhausted {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.stage-quota {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: clamp(20px, 3vw, 32px);
+  font-weight: 700;
+  color: #93c5fd;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 18px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+}
+
+.stage-quota.timer-warning {
+  color: #fff;
+  background: var(--danger);
+  border-color: #fca5a5;
+  animation: countdown-blink 1s ease-in-out infinite;
+}
+
+.people-quota {
+  font-size: 12px;
+  color: #93c5fd;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.people-quota.quota-exhausted { color: #fca5a5; }
+
+.log-item.kind-quota { color: #f0abfc; }
 
 .pulse {
   width: 14px;
