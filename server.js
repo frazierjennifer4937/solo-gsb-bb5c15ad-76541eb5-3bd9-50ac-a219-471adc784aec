@@ -27,6 +27,7 @@
  *   { type: "topic_create", version, title, durationSec }  // 主持人：发起当前议题并设置截止秒数
  *   { type: "topic_end",    version }                      // 主持人：提前结束并结算当前议题
  *   { type: "topic_vote",   version, topicId, choice }     // choice=yes|no|abstain；截止前可改投
+ *   { type: "quota_reset",  version, minutes }             // 主持人：开启累计发言配额（1~30 整数分钟）/ 重置新周期
  *
  * 服务端 -> 客户端
  *   { type: "joined",  snapshot, you:{id,secret,host} }
@@ -70,6 +71,20 @@
  * clearTimeout 并替换 room.topic，旧回调直接忽略，绝不结算后续议题。
  * 结算结果（赞成/反对/弃权票数与通过/否决/平票结论）追加到 room.topicHistory
  * 并随快照下发，断线重连后实时票数、剩余时间与已结算结果均连续恢复。
+ *
+ * 累计发言配额：主持人 quota_reset（携带 1~30 分钟）为每人开启同等额度的
+ * 「累计发言配额」并同时开启一个新周期（room.quota：limitMs 与唯一 cycleId）。
+ * 快照 quota 字段下发周期标识、每人本周期已用 usedMs 与剩余 remainMs；
+ * 当前发言人的本轮临时扣减由各客户端按 startedAt + serverTs 自行实时推算，
+ * 重连后凭最新快照继续显示真实余额。服务端按每轮实际发言时长在结算时扣减
+ * （手动结束、到期、切换、移出、离开、撤销前的原轮、一键清空都会结算），
+ * 手动结束与到期回调竞争时由 room.speaking 原子置空 + 轮次守卫保证只结算一次。
+ * 定时任务排程到「本轮限时终点」与「配额耗尽点」中较早者：到点原因不同，
+ * 分别记为时间到 / 配额用尽。额度耗尽后当前轮次自动结束，且该成员禁止再次
+ * 排队（request_speaking 返回 QUOTA_EXHAUSTED，主持人 start_speaking 同样拒绝，
+ * 点名接力跳过耗尽者点名下一人）。再次 quota_reset 即开启新周期：已用清零、
+ * 周期标识更新；进行中的发言轮次立即转入新周期并按新额度重新排程，
+ * 旧周期定时回调因 cycleId / roundId 不匹配作废，旧周期回调不得扣减新周期。
  */
 
 'use strict';
@@ -91,6 +106,10 @@ const SWAP_RESOLVED_TTL_MS = parseInt(process.env.SWAP_RESOLVED_TTL_MS, 10) || 3
 const SPEAK_TIME_UNIT_MS = parseInt(process.env.SPEAK_TIME_UNIT_MS, 10) || 60000;
 const SPEAK_MIN_MINUTES = 1;
 const SPEAK_MAX_MINUTES = 30;
+// 累计发言配额：每人每周期配额的单位（默认 1 分钟）。测试可调小以快速验证耗尽自动结束
+const QUOTA_UNIT_MS = parseInt(process.env.QUOTA_UNIT_MS, 10) || 60000;
+const QUOTA_MIN_MINUTES = 1;
+const QUOTA_MAX_MINUTES = 30;
 // 队首点名接力：每人的确认时限（默认 20 秒）。测试可调小以快速验证超时接力
 const ROLLCALL_TIMEOUT_MS = parseInt(process.env.ROLLCALL_TIMEOUT_MS, 10) || 20000;
 // 议题投票：截止时长下限（默认 10 秒）。测试可调小（如 1 秒）以快速验证到期结算
@@ -119,9 +138,16 @@ app.use(express.static(path.join(__dirname, 'public')));
  *   version,                 // 单调递增的状态版本号
  *   participants: Map<id, {id, nick, joinedAt, online, ws?}>,
  *   order: [id],             // 排队顺序
- *   speaking: { id, startedAt, endsAt, roundId } | null,
+ *   speaking: { id, startedAt, endsAt, roundId, quotaCycleId, quotaStartUsed } | null,
  *                            // endsAt 为 null 表示不限时；roundId 是唯一轮次标识
+ *                            // quotaCycleId 为本轮发言计入的配额周期（null=配额未开启时开始）
+ *                            // quotaStartUsed 为开始时该成员本周期已用毫秒（结算时据此扣减）
  *   speakTimer,              // 当前轮次的到期定时器（Timeout | null）
+ *   quota: null | {          // 累计发言配额（null 表示主持人尚未开启）
+ *     cycleId,               // 周期唯一标识（重置后更新；旧定时回调据此作废）
+ *     limitMs,               // 每人每周期总额度（毫秒）
+ *     used: Map<participantId, number>  // 本周期每人已结算的累计发言毫秒
+ *   },
  *   rollcall: null | {
  *     callId,                // 本轮点名接力的唯一标识（确认/跳过命令须携带并校验）
  *     roundNo,               // 本轮内第几次点名（每次点名 +1，用于旧定时回调守卫）
@@ -167,6 +193,7 @@ function newRoom(code) {
     order: [],
     speaking: null,
     speakTimer: null,
+    quota: null,
     rollcall: null,
     swaps: new Map(),
     undo: null,
@@ -197,7 +224,7 @@ function addLog(room, kind, text) {
 }
 
 // ---------------------------------------------------------------------------
-// 限时发言：服务端定时任务（轮次守卫）
+// 限时发言 + 累计发言配额：服务端定时任务（轮次 / 周期守卫）
 // ---------------------------------------------------------------------------
 
 /** 使当前轮次的到期定时任务失效（手动结束/撤销/切换/移出/清空时调用） */
@@ -208,34 +235,187 @@ function clearSpeakTimer(room) {
   }
 }
 
+/** 该成员当前周期已结算的累计发言毫秒（配额未开启时为 0） */
+function quotaUsedOf(room, participantId) {
+  if (!room.quota) return 0;
+  return room.quota.used.get(participantId) || 0;
+}
+
+/** 该成员当前周期剩余配额毫秒；配额未开启返回 null */
+function quotaRemainOf(room, participantId) {
+  if (!room.quota) return null;
+  return Math.max(room.quota.limitMs - quotaUsedOf(room, participantId), 0);
+}
+
 /**
- * 为当前限时发言轮次安排服务端自动结束。
- * 回调内以 roundId 二次校验：旧轮次的回调不得结束后续轮次。
+ * 计算一轮发言的结束时间点：
+ * - endsAt 为本轮限时终点（start_speaking 携带 durationMin 时存在）；
+ * - 配额开启时，配额耗尽点（开始时已用 + 本轮开始时刻 + 剩余额度）同样封顶；
+ * - 两者取较早者，返回 { endsAt, quotaLimited }。
+ */
+function speakDeadline(room, speaking) {
+  let deadline = speaking.endsAt ?? null;
+  let quotaLimited = false;
+  if (room.quota && speaking.quotaCycleId === room.quota.cycleId) {
+    const remain = Math.max(room.quota.limitMs - (speaking.quotaStartUsed || 0), 0);
+    const quotaEndsAt = speaking.startedAt + remain;
+    if (deadline === null || quotaEndsAt < deadline) {
+      deadline = quotaEndsAt;
+      quotaLimited = true; // 封顶点来自配额耗尽而非本轮限时
+    }
+  }
+  return { deadline, quotaLimited };
+}
+
+/**
+ * 为当前发言轮次安排服务端自动结束。
+ * 定时到「本轮限时终点」与「配额耗尽点」中较早者。回调内以 roundId + cycleId
+ * 双重校验：旧轮次 / 旧配额周期的回调不得结束后续轮次，也不得扣减新周期。
  */
 function scheduleSpeakTimer(room) {
   clearSpeakTimer(room);
   const speaking = room.speaking;
-  if (!speaking || !speaking.endsAt) return;
+  if (!speaking) return;
+  const { deadline } = speakDeadline(room, speaking);
+  if (deadline === null) return;
   const roundId = speaking.roundId;
-  const delay = Math.max(speaking.endsAt - Date.now(), 0);
+  const cycleId = speaking.quotaCycleId;
+  const delay = Math.max(deadline - Date.now(), 0);
   room.speakTimer = setTimeout(() => {
     room.speakTimer = null;
-    if (!room.speaking || room.speaking.roundId !== roundId) return; // 旧回调作废
+    if (!room.speaking || room.speaking.roundId !== roundId) return; // 旧轮次回调作废
+    if (room.speaking.quotaCycleId !== cycleId) return;               // 旧周期回调作废
     autoEndSpeaking(room, roundId);
   }, delay);
   if (room.speakTimer.unref) room.speakTimer.unref();
 }
 
 /**
- * 到时自动结束：与手动结束一样是一次普通版本化状态变更
+ * 结算当前发言轮次：按实际发言时长扣减累计配额，然后结束本轮。
+ * 手动结束 / 切换 / 移出 / 离开 / 清空 / 撤销 / 到期回调全部汇聚于此，
+ * 由 room.speaking 原子置空保证「手动结束与到期回调竞争时只结算一次」。
+ * 返回 { chargedCycleId, chargedMs }（开启配额且本周期开始时）供撤销退款使用。
+ */
+function settleSpeaking(room) {
+  const speaking = room.speaking;
+  if (!speaking) return null;
+  clearSpeakTimer(room);
+  const id = speaking.id;
+  const actualMs = Math.max(Date.now() - speaking.startedAt, 0);
+  let chargedCycleId = null;
+  let chargedMs = 0;
+  if (room.quota && speaking.quotaCycleId === room.quota.cycleId) {
+    const remain = Math.max(room.quota.limitMs - (speaking.quotaStartUsed || 0), 0);
+    chargedMs = Math.min(actualMs, remain); // 不超过开始时的剩余额度
+    if (chargedMs > 0) {
+      room.quota.used.set(id, (room.quota.used.get(id) || 0) + chargedMs);
+    }
+    chargedCycleId = room.quota.cycleId;
+  }
+  room.speaking = null;
+  return { chargedCycleId, chargedMs };
+}
+
+/** 撤销主持人操作时退还此前结算的配额扣减（周期已被重置则不退） */
+function refundQuota(room, charge) {
+  if (!charge || !charge.chargedCycleId || !charge.chargedMs) return;
+  if (!room.quota || room.quota.cycleId !== charge.chargedCycleId) return;
+  const cur = room.quota.used.get(charge.id) || 0;
+  room.quota.used.set(charge.id, Math.max(cur - charge.chargedMs, 0));
+}
+
+/** 从结算结果构造撤销用的扣减记录（成员已离开房间时仍保留其周期用量也无妨） */
+function chargeRecord(speaking, settled) {
+  if (!settled || !settled.chargedCycleId) return null;
+  return { id: speaking.id, chargedCycleId: settled.chargedCycleId, chargedMs: settled.chargedMs };
+}
+
+/**
+ * 到时自动结束：判定本轮到点原因（限时时间到 / 累计配额用尽），
+ * 与手动结束一样是一次普通版本化状态变更
  * （version+1、广播快照、写操作记录，并使挂起的撤销失效）。
  */
 function autoEndSpeaking(room, roundId) {
-  const speaker = room.participants.get(room.speaking.id);
-  const nick = speaker ? speaker.nick : '已离开';
-  room.speaking = null;
-  addLog(room, 'talk', `「${nick}」发言时间到，自动结束本轮（轮次 ${roundId}）`);
+  const speaking = room.speaking;
+  if (!speaking) return; // 竞争保护：已被手动结束结算
+  const id = speaking.id;
+  const nick = room.participants.get(id)?.nick ?? '已离开';
+  const now = Date.now();
+  const { deadline, quotaLimited } = speakDeadline(room, speaking);
+  const roundTimedOut = speaking.endsAt !== null && now >= speaking.endsAt;
+  const quotaExhausted =
+    room.quota &&
+    speaking.quotaCycleId === room.quota.cycleId &&
+    quotaLimited &&
+    deadline !== null &&
+    now >= deadline &&
+    !roundTimedOut;
+  settleSpeaking(room);
+  if (quotaExhausted) {
+    addLog(room, 'talk', `「${nick}」累计发言配额已用尽，自动结束本轮（轮次 ${roundId}）`);
+  } else {
+    addLog(room, 'talk', `「${nick}」发言时间到，自动结束本轮（轮次 ${roundId}）`);
+  }
   commit(room, { undoReason: 'speaking_changed' });
+}
+
+// ---------------------------------------------------------------------------
+// 累计发言配额：开启 / 重置周期
+// ---------------------------------------------------------------------------
+
+/** 配额分钟数的中文文案 */
+function quotaMinutesText(limitMs) {
+  return Math.round(limitMs / QUOTA_UNIT_MS);
+}
+
+/**
+ * 主持人开启累计发言配额或重置新周期：
+ * 每人获得同等的全新额度、已用清零、cycleId 更新（旧周期定时回调随之作废）。
+ * 进行中的发言轮次立即转入新周期（保留原轮次标识与开始时刻），并按新额度
+ * 重新排程：旧周期回调既不匹配 roundId 的重排，也不匹配 cycleId，绝不扣减新周期。
+ * 调用前已完成主持人与版本守卫。
+ */
+function resetQuota(room, minutes) {
+  const limitMs = minutes * QUOTA_UNIT_MS;
+  const hadQuota = !!room.quota;
+  const cycleId = genId('cy_');
+  room.quota = {
+    cycleId,
+    limitMs,
+    used: new Map()
+  };
+  if (room.speaking) {
+    // 进行中的发言转入新周期：自此刻起计入新周期，已用按 0 起算；
+    // 旧周期若有应计而未计的时长，随旧周期丢弃（重置即新周期语义）。
+    room.speaking.quotaCycleId = cycleId;
+    room.speaking.quotaStartUsed = 0;
+    scheduleSpeakTimer(room);
+  }
+  addLog(
+    room,
+    'quota',
+    hadQuota
+      ? `主持人重置发言配额周期：每人 ${minutes} 分钟，已用额度已清零（新周期 ${cycleId}）`
+      : `主持人开启累计发言配额：每人 ${minutes} 分钟，按实际发言时长扣减（周期 ${cycleId}）`
+  );
+}
+
+/** 构建快照中的配额视图：周期标识、每人已用 / 剩余毫秒 */
+function buildQuotaView(room) {
+  if (!room.quota) return null;
+  const used = {};
+  for (const p of room.participants.values()) {
+    used[p.id] = quotaUsedOf(room, p.id);
+  }
+  return {
+    cycleId: room.quota.cycleId,
+    limitMs: room.quota.limitMs,
+    minutes: quotaMinutesText(room.quota.limitMs),
+    used,
+    remain: Object.fromEntries(
+      Object.entries(used).map(([id, ms]) => [id, Math.max(room.quota.limitMs - ms, 0)])
+    )
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -299,8 +479,19 @@ function callNextRollcall(room) {
   const rc = room.rollcall;
   if (!rc) return;
   clearRollcallTimer(room);
-  const nextIdx = rc.pending.findIndex((id) => !rc.called.has(id) && room.order.includes(id));
+  // 配额开启后，本周期额度已用尽的成员跳过（不消耗本轮点名名额之外的额外处理：
+  // 耗尽者禁止排队，但可能在开启配额前就已在队列中）
+  const nextIdx = rc.pending.findIndex(
+    (id) => !rc.called.has(id) && room.order.includes(id) && quotaRemainOf(room, id) !== 0
+  );
   if (nextIdx === -1) {
+    // 余下成员均已点过或在本周期配额耗尽：点名接力结束
+    for (const id of rc.pending) {
+      if (!rc.called.has(id) && room.order.includes(id)) {
+        rc.called.add(id);
+        addLog(room, 'rollcall', `「${room.participants.get(id)?.nick ?? '已离开'}」累计配额已用尽，跳过点名`);
+      }
+    }
     finishRollcall(room);
     addLog(room, 'rollcall', '本轮点名结束：全部成员均已跳过，接力结束');
     return;
@@ -336,6 +527,12 @@ function scheduleRollcallTimer(room, targetId, roundNo, deadline) {
 function rollcallConfirm(room, targetId) {
   const rc = room.rollcall;
   const nick = room.participants.get(targetId)?.nick ?? '已离开';
+  if (quotaRemainOf(room, targetId) === 0) {
+    // 防御性校验：配额在点名等待期间被重置为更小额度等极端情况下，耗尽者不能开始发言
+    addLog(room, 'rollcall', `「${nick}」累计配额已用尽，无法开始发言，自动点名下一人`);
+    rollcallSkip(room, targetId, 'timeout');
+    return;
+  }
   finishRollcall(room);
   const idx = room.order.indexOf(targetId);
   if (idx !== -1) {
@@ -347,8 +544,11 @@ function rollcallConfirm(room, targetId) {
     id: targetId,
     startedAt: Date.now(),
     endsAt: null,
-    roundId: genId('rd_')
+    roundId: genId('rd_'),
+    quotaCycleId: room.quota ? room.quota.cycleId : null,
+    quotaStartUsed: room.quota ? quotaUsedOf(room, targetId) : 0
   };
+  scheduleSpeakTimer(room);
   addLog(room, 'rollcall', `「${nick}」已确认点名，开始发言`);
   // 点名接力在一人确认发言后结束（同一轮每人最多被点名一次）
   commit(room, { undoReason: 'speaking_changed' });
@@ -520,6 +720,7 @@ const UNDO_REASON_TEXT = {
   swap_changed: '换位状态出现新的变更',
   rollcall_changed: '队首点名接力状态出现新的变更',
   topic_changed: '议题投票状态出现新的变更',
+  quota_changed: '累计发言配额周期出现新的变更',
   cleared: '主持人清空了队列',
   logs_cleared: '主持人清空了操作记录',
   state_changed: '房间状态出现新的变更'
@@ -702,6 +903,7 @@ function buildSnapshot(room) {
       resolvedAt: s.resolvedAt || null
     })),
     undo: buildUndoSnapshot(room),
+    quota: buildQuotaView(room),
     topic: buildTopicView(room.topic),
     topicHistory: room.topicHistory.map((t) => ({
       id: t.id,
@@ -839,6 +1041,7 @@ wss.on('connection', (ws) => {
         case 'topic_create':
         case 'topic_end':
         case 'topic_vote':
+        case 'quota_reset':
           return handleCommand(ws, msg, room, pid, isHost);
 
         default:
@@ -1010,8 +1213,7 @@ function handleLeave(room, id, reason) {
   const wasRollcallTarget = room.rollcall && room.rollcall.currentId === id;
 
   if (wasSpeaking) {
-    clearSpeakTimer(room);
-    room.speaking = null;
+    settleSpeaking(room); // 主动离开同样按实际发言时长结算配额
   }
   // 主动离开：该方参与的待处理换位邀请随之失效（断线保留，不清理）
   invalidateSwaps(room, 'left', (s) => s.from === id || s.to === id, (side, s) =>
@@ -1087,6 +1289,9 @@ function handleCommand(ws, msg, room, pid, isHost) {
       }
       if (room.order.includes(pid)) {
         return sendError(ws, '你已在发言队列中', 'ALREADY_QUEUED', room);
+      }
+      if (quotaRemainOf(room, pid) === 0) {
+        return sendError(ws, '本周期累计发言配额已用尽，无法再次排队', 'QUOTA_EXHAUSTED', room);
       }
       room.order.push(pid);
       addLog(room, 'queue', `「${me.nick}」申请发言`);
@@ -1255,16 +1460,25 @@ function handleCommand(ws, msg, room, pid, isHost) {
         }
         durationMin = d;
       }
+      // 累计配额耗尽：主持人也不能请其发言（先重置配额周期再开始）
+      if (quotaRemainOf(room, targetId) === 0) {
+        return sendError(ws, '该成员本周期发言配额已用尽，请先重置配额周期', 'QUOTA_EXHAUSTED', room);
+      }
 
       // 逆操作：结束目标发言，必要时把其放回原队列位置，并恢复之前的发言人
-      const prevSpeaking = room.speaking
+      // （结算必须在 armUndo 之前完成，payload 记录原发言人快照与本轮配额扣减）
+      const prevSpeakingRaw = room.speaking;
+      const prevSpeaking = prevSpeakingRaw
         ? {
-            id: room.speaking.id,
-            startedAt: room.speaking.startedAt,
-            endsAt: room.speaking.endsAt ?? null,
-            roundId: room.speaking.roundId
+            id: prevSpeakingRaw.id,
+            startedAt: prevSpeakingRaw.startedAt,
+            endsAt: prevSpeakingRaw.endsAt ?? null,
+            roundId: prevSpeakingRaw.roundId,
+            quotaCycleId: prevSpeakingRaw.quotaCycleId ?? null,
+            quotaStartUsed: prevSpeakingRaw.quotaStartUsed ?? 0
           }
         : null;
+      const prevCharge = prevSpeakingRaw ? chargeRecord(prevSpeakingRaw, settleSpeaking(room)) : null;
       const idx = room.order.indexOf(targetId);
       const prevNick = prevSpeaking
         ? room.participants.get(prevSpeaking.id)?.nick ?? '已离开'
@@ -1282,11 +1496,11 @@ function handleCommand(ws, msg, room, pid, isHost) {
         targetNick: target.nick,
         queueIndex: idx,               // -1 表示原来不在队列中
         prevSpeaking,
-        prevSpeakingNick: prevNick
+        prevSpeakingNick: prevNick,
+        prevCharge                    // 原发言人本轮配额扣减（撤销时退还）
       });
-      if (room.speaking) {
-        const prev = room.participants.get(room.speaking.id);
-        room.speaking = null;
+      if (prevSpeakingRaw) {
+        const prev = room.participants.get(prevSpeakingRaw.id);
         addLog(room, 'talk', `「${prev ? prev.nick : '已离开'}」发言结束`);
       }
       if (idx !== -1) {
@@ -1300,7 +1514,9 @@ function handleCommand(ws, msg, room, pid, isHost) {
         id: targetId,
         startedAt: now,
         endsAt: durationMin ? now + durationMin * SPEAK_TIME_UNIT_MS : null,
-        roundId: genId('rd_')
+        roundId: genId('rd_'),
+        quotaCycleId: room.quota ? room.quota.cycleId : null,
+        quotaStartUsed: room.quota ? quotaUsedOf(room, targetId) : 0
       };
       scheduleSpeakTimer(room);
       addLog(
@@ -1316,18 +1532,20 @@ function handleCommand(ws, msg, room, pid, isHost) {
     case 'end_speaking': {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       if (!room.speaking) return sendError(ws, '当前没有人发言', 'NO_SPEAKER', room);
-      const speaker = room.participants.get(room.speaking.id);
+      const speaking = room.speaking;
+      const speaker = room.participants.get(speaking.id);
       const speakerNick = speaker ? speaker.nick : '已离开';
       // 逆操作：以原 startedAt/endsAt/roundId 恢复当前发言（计时连续，不产生新的计时起点）
       armUndo(room, 'end_speaking', `结束「${speakerNick}」的发言`, {
-        id: room.speaking.id,
+        id: speaking.id,
         nick: speakerNick,
-        startedAt: room.speaking.startedAt,
-        endsAt: room.speaking.endsAt ?? null,
-        roundId: room.speaking.roundId
+        startedAt: speaking.startedAt,
+        endsAt: speaking.endsAt ?? null,
+        roundId: speaking.roundId,
+        quotaCycleId: speaking.quotaCycleId ?? null,
+        quotaStartUsed: speaking.quotaStartUsed ?? 0,
+        charge: chargeRecord(speaking, settleSpeaking(room)) // 本轮配额扣减（撤销时退还）
       });
-      clearSpeakTimer(room); // 手动结束：旧定时任务失效
-      room.speaking = null;
       addLog(room, 'talk', `主持人结束「${speakerNick}」的发言`);
       return commit(room, { undoArm: true });
     }
@@ -1373,6 +1591,10 @@ function handleCommand(ws, msg, room, pid, isHost) {
       const speakingStartedAt = wasSpeaking ? room.speaking.startedAt : null;
       const speakingEndsAt = wasSpeaking ? room.speaking.endsAt ?? null : null;
       const speakingRoundId = wasSpeaking ? room.speaking.roundId : null;
+      const speakingQuotaCycleId = wasSpeaking ? room.speaking.quotaCycleId ?? null : null;
+      const speakingQuotaStartUsed = wasSpeaking ? room.speaking.quotaStartUsed ?? 0 : 0;
+      // 被移出者正在发言：先按实际时长结算配额（撤销时退还）
+      const speakingCharge = wasSpeaking ? chargeRecord(room.speaking, settleSpeaking(room)) : null;
       armUndo(room, 'remove', `将「${target.nick}」移出队列`, {
         targetId,
         nick: target.nick,
@@ -1380,13 +1602,12 @@ function handleCommand(ws, msg, room, pid, isHost) {
         wasSpeaking,
         speakingStartedAt,
         speakingEndsAt,
-        speakingRoundId
+        speakingRoundId,
+        speakingQuotaCycleId,
+        speakingQuotaStartUsed,
+        speakingCharge
       });
       if (queueIndex !== -1) room.order.splice(queueIndex, 1);
-      if (wasSpeaking) {
-        clearSpeakTimer(room);
-        room.speaking = null;
-      }
       invalidateSwaps(room, 'removed', (s) => s.from === targetId || s.to === targetId);
       // 点名进行中：被移出者若为当前对象，立即点名下一人
       const rollcallMoved = room.rollcall && rollcallTargetGone(room, targetId);
@@ -1402,8 +1623,7 @@ function handleCommand(ws, msg, room, pid, isHost) {
     case 'clear': {
       if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
       room.order = [];
-      clearSpeakTimer(room);
-      room.speaking = null;
+      settleSpeaking(room); // 一键清空同样按实际发言时长结算配额（只结算一次）
       finishRollcall(room);
       room.logs = [];
       invalidateSwaps(room, 'cleared');
@@ -1520,6 +1740,22 @@ function handleCommand(ws, msg, room, pid, isHost) {
       topic.votes.set(pid, choice); // 每人一票：重复投票以最新选择为准
       return commit(room, { undoReason: 'topic_changed' });
     }
+
+    case 'quota_reset': {
+      if (!guardVersion(ws, msg, room) || !requireHost(ws, room, isHost)) return;
+      const minutes = Number(msg.minutes);
+      if (!Number.isInteger(minutes) || minutes < QUOTA_MIN_MINUTES || minutes > QUOTA_MAX_MINUTES) {
+        return sendError(
+          ws,
+          `每人配额须为 ${QUOTA_MIN_MINUTES}～${QUOTA_MAX_MINUTES} 分钟的整数`,
+          'BAD_DURATION',
+          room
+        );
+      }
+      // 同样经过版本守卫；重置即开启新周期（cycleId 更新，旧定时回调作废）
+      resetQuota(room, minutes);
+      return commit(room, { undoReason: 'quota_changed' });
+    }
   }
 }
 
@@ -1562,6 +1798,20 @@ function handleUndoHost(ws, room) {
 
   const { op, payload } = undo;
 
+  /**
+   * 按撤销 payload 恢复一个发言轮次：保留原 startedAt / endsAt / roundId，
+   * 以及配额周期标识与开始时已用额度。周期已被重置时，恢复的轮次不再计入任何周期
+   * （quotaCycleId 与当前 cycleId 不匹配：不扣减、也不排程配额守卫之外的限时）。
+   */
+  const restoreSpeaking = (data) => ({
+    id: data.id,
+    startedAt: data.startedAt,
+    endsAt: data.endsAt ?? null,
+    roundId: data.roundId || genId('rd_'),
+    quotaCycleId: data.quotaCycleId ?? null,
+    quotaStartUsed: data.quotaStartUsed ?? 0
+  });
+
   if (op === 'reorder') {
     // 仅恢复队列位置；成员集合若被介入变更改动，撤销理应早已失效，
     // 这里仍防御性地只恢复当前仍在房间内的成员的相对顺序。
@@ -1581,12 +1831,15 @@ function handleUndoHost(ws, room) {
       room.order.splice(at, 0, payload.targetId);
     }
     if (payload.wasSpeaking && !room.speaking) {
-      room.speaking = {
+      refundQuota(room, payload.speakingCharge);
+      room.speaking = restoreSpeaking({
         id: payload.targetId,
         startedAt: payload.speakingStartedAt,
-        endsAt: payload.speakingEndsAt ?? null,
-        roundId: payload.speakingRoundId || genId('rd_')
-      };
+        endsAt: payload.speakingEndsAt,
+        roundId: payload.speakingRoundId,
+        quotaCycleId: payload.speakingQuotaCycleId,
+        quotaStartUsed: payload.speakingQuotaStartUsed
+      });
       scheduleSpeakTimer(room);
     }
     if (payload.queueIndex !== -1 || payload.wasSpeaking) {
@@ -1602,15 +1855,13 @@ function handleUndoHost(ws, room) {
       delete undo.payload;
       return sendError(ws, '撤销已失效：成员已离开房间', 'UNDO_INVALIDATED', room);
     }
-    // 撤销开始：当前轮次定时任务失效；若恢复原发言人则按原 endsAt 重新排程
+    // 撤销开始：当前轮次（含其配额扣减）退还；若恢复原发言人则按原 endsAt 重新排程
+    // 注意：被撤销的本轮目标发言人刚开始发言，其本轮扣减由 start_speaking 提交时
+    // 尚未结算（撤销先于其结束发生），无需退款；只需退还被切换下去的原发言人扣减。
+    refundQuota(room, payload.prevCharge);
     clearSpeakTimer(room);
     room.speaking = payload.prevSpeaking && room.participants.has(payload.prevSpeaking.id)
-      ? {
-          id: payload.prevSpeaking.id,
-          startedAt: payload.prevSpeaking.startedAt,
-          endsAt: payload.prevSpeaking.endsAt ?? null,
-          roundId: payload.prevSpeaking.roundId || genId('rd_')
-        }
+      ? restoreSpeaking(payload.prevSpeaking)
       : null;
     scheduleSpeakTimer(room);
     if (payload.queueIndex !== -1 && room.order.indexOf(payload.targetId) === -1) {
@@ -1633,13 +1884,9 @@ function handleUndoHost(ws, room) {
       delete undo.payload;
       return sendError(ws, '撤销已失效：当前发言状态出现新的变更', 'UNDO_INVALIDATED', room);
     }
-    room.speaking = {
-      id: payload.id,
-      startedAt: payload.startedAt,
-      endsAt: payload.endsAt ?? null,
-      roundId: payload.roundId || genId('rd_')
-    };
-    scheduleSpeakTimer(room); // 限时轮次恢复后倒计时继续（已到期则立即自动结束）
+    refundQuota(room, payload.charge); // 退还结束时结算的配额扣减
+    room.speaking = restoreSpeaking(payload);
+    scheduleSpeakTimer(room); // 限时/配额轮次恢复后倒计时继续（已到期则立即自动结束）
     addLog(room, 'audit', `安全撤销：已恢复「${payload.nick}」的发言，计时连续`);
   } else {
     return sendError(ws, '未知的撤销操作', 'UNDO_NONE', room);

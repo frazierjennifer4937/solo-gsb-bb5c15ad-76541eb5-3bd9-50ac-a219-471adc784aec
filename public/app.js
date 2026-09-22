@@ -52,6 +52,11 @@ const els = {
   stageTimer: $('#stage-timer'),
   stageCountdown: $('#stage-countdown'),
   speakDuration: $('#speak-duration'),
+  quotaDuration: $('#quota-duration'),
+  btnQuotaReset: $('#btn-quota-reset'),
+  quotaBar: $('#quota-bar'),
+  quotaMeta: $('#quota-meta'),
+  stageQuota: $('#stage-quota'),
   btnEnd: $('#btn-end'),
   queueList: $('#queue-list'),
   queueEmpty: $('#queue-empty'),
@@ -149,6 +154,46 @@ function serverNow() {
   return Date.now() + state.clockOffset;
 }
 
+/**
+ * 某成员当前周期的真实剩余配额（毫秒）。
+ * 快照中的 remain 是「已结算」余额；若该成员正在发言，还要减去本轮已经讲的时长
+ * （以服务端 startedAt + serverTs 校准实时推算），因此断线重连后也显示真实余额。
+ * 配额未开启返回 null。
+ */
+function quotaRemain(snap, participantId) {
+  const q = snap.quota;
+  if (!q) return null;
+  let remain = q.remain[participantId];
+  if (remain === undefined) remain = q.limitMs; // 快照之后新加入等极端情况
+  if (snap.speaking && snap.speaking.id === participantId) {
+    const liveUsed = Math.max(serverNow() - snap.speaking.startedAt, 0);
+    remain = Math.max(remain - liveUsed, 0);
+  }
+  return remain;
+}
+
+/** 某成员当前周期已用配额（毫秒，含本轮实时时长） */
+function quotaUsed(snap, participantId) {
+  const q = snap.quota;
+  if (!q) return null;
+  let used = q.used[participantId] || 0;
+  if (snap.speaking && snap.speaking.id === participantId) {
+    used += Math.max(serverNow() - snap.speaking.startedAt, 0);
+  }
+  return Math.min(used, q.limitMs);
+}
+
+/** 配额余额标签 HTML：成员 / 队列条目复用；耗尽时给出醒目样式 */
+function quotaTagHtml(snap, participantId) {
+  if (!snap.quota) return '';
+  const remain = quotaRemain(snap, participantId);
+  if (remain === null) return '';
+  if (remain <= 0) {
+    return '<span class="quota-badge quota-exhausted" title="本周期累计发言配额已用尽">⛔ 配额已耗尽</span>';
+  }
+  return `<span class="quota-badge" title="本周期累计配额剩余">⏳ ${formatDuration(remain)}</span>`;
+}
+
 // 限时时长选项：1～30 分钟（「不限时」为默认项，见 index.html）
 for (let m = 1; m <= 30; m++) {
   const opt = document.createElement('option');
@@ -160,6 +205,20 @@ for (let m = 1; m <= 30; m++) {
 /** 主持人当前选择的限时时长（分钟）；null 表示不限时 */
 function chosenDurationMin() {
   const v = parseInt(els.speakDuration.value, 10);
+  return Number.isInteger(v) && v >= 1 && v <= 30 ? v : null;
+}
+
+// 累计发言配额选项：1～30 分钟（「未开启」为默认项，见 index.html）
+for (let m = 1; m <= 30; m++) {
+  const opt = document.createElement('option');
+  opt.value = String(m);
+  opt.textContent = `${m} 分钟`;
+  els.quotaDuration.appendChild(opt);
+}
+
+/** 主持人当前选择的配额时长（分钟）；null 表示未选择 */
+function chosenQuotaMin() {
+  const v = parseInt(els.quotaDuration.value, 10);
   return Number.isInteger(v) && v >= 1 && v <= 30 ? v : null;
 }
 
@@ -515,6 +574,7 @@ function render() {
   const snap = state.snapshot;
   if (!snap) return;
   renderStage(snap);
+  renderQuotaBar(snap);
   renderRollcall(snap);
   renderQueue(snap);
   renderUndoBar(snap);
@@ -537,11 +597,14 @@ function renderStage(snap) {
     els.stageNick.innerHTML =
       `<span class="pulse"></span> ${escapeHtml(snap.speaking.nick)}`;
     updateTimer();
+    updateStageQuota();
   } else {
     els.stageIdle.classList.remove('hidden');
     els.stageActive.classList.add('hidden');
     els.stageCountdown.classList.add('hidden');
     els.stageCountdown.classList.remove('timer-warning');
+    els.stageQuota.classList.add('hidden');
+    els.stageQuota.classList.remove('quota-exhausted');
   }
 }
 
@@ -604,14 +667,111 @@ function updateTimer() {
     els.stageCountdown.classList.add('hidden');
     els.stageCountdown.classList.remove('timer-warning');
   }
+  updateStageQuota();
+}
+
+/** 舞台区：当前发言人本周期的累计配额实时余额（含本轮已讲时长） */
+function updateStageQuota() {
+  const snap = state.snapshot;
+  if (!snap || !snap.speaking || !snap.quota) {
+    els.stageQuota.classList.add('hidden');
+    els.stageQuota.classList.remove('quota-exhausted');
+    return;
+  }
+  const id = snap.speaking.id;
+  const remain = quotaRemain(snap, id);
+  const used = quotaUsed(snap, id);
+  els.stageQuota.classList.remove('hidden');
+  els.stageQuota.classList.toggle('quota-exhausted', remain <= 0);
+  els.stageQuota.textContent =
+    `累计配额：已用 ${formatDuration(used)} / ${formatDuration(snap.quota.limitMs)}　剩余 ${formatDuration(remain)}`;
+}
+
+/**
+ * 配额状态条：展示当前周期标识、每人额度，以及全体成员（在场成员）的
+ * 已用 / 剩余毫秒。当前发言人由定时刷新实时扣减，其余成员显示结算值。
+ */
+function renderQuotaBar(snap) {
+  const q = snap.quota;
+  if (!q) {
+    els.quotaBar.hidden = true;
+    return;
+  }
+  els.quotaBar.hidden = false;
+  const cycleShort = String(q.cycleId || '').replace(/^cy_/, '').slice(0, 6);
+  const rows = snap.participants
+    .slice()
+    .sort((a, b) => (quotaRemain(snap, a.id) || 0) - (quotaRemain(snap, b.id) || 0))
+    .map((p) => {
+      const remain = quotaRemain(snap, p.id);
+      const used = Math.min(quotaUsed(snap, p.id), q.limitMs);
+      const pct = q.limitMs > 0 ? Math.round((used / q.limitMs) * 100) : 0;
+      const exhausted = remain <= 0;
+      const isSpeaking = snap.speaking && snap.speaking.id === p.id;
+      return `
+        <div class="quota-row${exhausted ? ' is-exhausted' : ''}" data-id="${p.id}">
+          <span class="quota-row-name">${escapeHtml(p.nick)}${isSpeaking ? ' 🎙️' : ''}</span>
+          <span class="quota-row-bar"><span class="quota-row-fill" style="width:${pct}%"></span></span>
+          <span class="quota-row-ms">${formatDuration(used)} / ${formatDuration(q.limitMs)}</span>
+          <span class="quota-row-remain">${exhausted ? '已耗尽' : `剩 ${formatDuration(remain)}`}</span>
+        </div>`;
+    })
+    .join('');
+  els.quotaMeta.innerHTML =
+    `每人 <b>${q.minutes}</b> 分钟 · 周期 <code>${escapeHtml(cycleShort)}</code>` +
+    ` <span class="quota-hint">（按每轮实际发言时长扣减，耗尽后自动结束并禁止再次排队）</span>`;
+  const list = els.quotaBar.querySelector('.quota-list');
+  if (list) list.remove();
+  const div = document.createElement('div');
+  div.className = 'quota-list';
+  div.innerHTML = rows;
+  els.quotaBar.appendChild(div);
+  updateStageQuota();
 }
 
 if (!state.timerHandle) {
   state.timerHandle = setInterval(() => {
     updateTimer();
+    updateStageQuota();
+    renderQuotaBarLive();
     updateRollcallCountdown();
     updateTopicCountdown();
   }, 250);
+}
+
+/** 高频刷新配额条 / 队列 / 成员中的实时余额（仅配额开启时，轻量更新文本） */
+function renderQuotaBarLive() {
+  const snap = state.snapshot;
+  if (!snap || !snap.quota) return;
+  const q = snap.quota;
+  // 配额条内当前发言人的已用/剩余/进度条随本轮实时跳动
+  if (!els.quotaBar.hidden) {
+    els.quotaBar.querySelectorAll('.quota-row').forEach((row) => {
+      const id = row.dataset.id;
+      const speaking = snap.speaking && snap.speaking.id === id;
+      if (!speaking) return;
+      const remain = quotaRemain(snap, id);
+      const used = Math.min(quotaUsed(snap, id), q.limitMs);
+      const pct = q.limitMs > 0 ? Math.round((used / q.limitMs) * 100) : 0;
+      const fill = row.querySelector('.quota-row-fill');
+      if (fill) fill.style.width = `${pct}%`;
+      const ms = row.querySelector('.quota-row-ms');
+      if (ms) ms.textContent = `${formatDuration(used)} / ${formatDuration(q.limitMs)}`;
+      const rem = row.querySelector('.quota-row-remain');
+      if (rem) rem.textContent = remain <= 0 ? '已耗尽' : `剩 ${formatDuration(remain)}`;
+    });
+  }
+  // 队列条目与成员条目的余额徽标：当前发言人实时更新
+  const speakingId = snap.speaking ? snap.speaking.id : null;
+  if (speakingId) {
+    const remain = quotaRemain(snap, speakingId);
+    if (remain <= 0) return; // 耗尽样式由下一次快照固化
+    const liveText = `⏳ ${formatDuration(remain)}`;
+    document.querySelectorAll(`.queue-item[data-id="${CSS.escape(speakingId)}"] .quota-badge`)
+      .forEach((el) => { if (!el.classList.contains('quota-exhausted')) el.textContent = liveText; });
+    document.querySelectorAll(`.people-item[data-id="${CSS.escape(speakingId)}"] .quota-badge`)
+      .forEach((el) => { if (!el.classList.contains('quota-exhausted')) el.textContent = liveText; });
+  }
 }
 
 function renderQueue(snap) {
@@ -637,6 +797,8 @@ function renderQueue(snap) {
     if (state.me && pid === state.me.id) li.classList.add('is-me');
     if (drag && drag.item.dataset.id === pid) li.classList.add('dragging');
     if (rc && rc.currentId === pid) li.classList.add('is-rollcall-current');
+    const quotaRemainMs = quotaRemain(snap, pid);
+    if (snap.quota && quotaRemainMs <= 0) li.classList.add('is-quota-exhausted');
 
     const pendingHere = (snap.swaps || []).find(
       (s) => s.status === 'pending' && (s.from === pid || s.to === pid)
@@ -671,17 +833,19 @@ function renderQueue(snap) {
     }
 
     li.draggable = false; // 使用自定义 pointer 拖拽，同时兼容触屏
+    const exhausted = snap.quota && quotaRemainMs <= 0;
     li.innerHTML = `
       <span class="drag-handle ${isHost ? '' : 'hidden'}" title="拖动排序">⠿</span>
       <span class="queue-index">${i + 1}</span>
       <span class="queue-nick">${escapeHtml(nick)}</span>
       ${state.me && pid === state.me.id ? '<span class="me-tag">我</span>' : ''}
+      ${quotaTagHtml(snap, pid)}
       ${rollcallTag}
       ${swapTag}
       ${p && !p.online ? '<span class="offline-tag">离线</span>' : ''}
       ${swapInviteBtn}
       ${isHost ? `
-        <button class="btn btn-primary btn-mini" data-act="start" title="请其发言">▶ 开始</button>
+        <button class="btn btn-primary btn-mini" data-act="start" title="${exhausted ? '配额已用尽，重置周期后才能发言' : '请其发言'}" ${exhausted ? 'disabled' : ''}>▶ 开始</button>
         <button class="btn btn-ghost btn-mini" data-act="remove" title="移出队列">✕</button>
       ` : ''}
     `;
@@ -702,10 +866,16 @@ function renderQueue(snap) {
     const myId = state.me.id;
     const inQueue = snap.order.includes(myId);
     const speaking = snap.speaking && snap.speaking.id === myId;
+    const myRemain = quotaRemain(snap, myId);
+    const quotaOut = myRemain !== null && myRemain <= 0;
     els.btnRequest.classList.toggle('hidden', inQueue || speaking);
     els.btnCancel.classList.toggle('hidden', !inQueue);
-    els.btnRequest.disabled = speaking;
-    els.btnRequest.textContent = speaking ? '你正在发言中' : '🙋 申请发言';
+    els.btnRequest.disabled = speaking || quotaOut;
+    if (quotaOut && !speaking) {
+      els.btnRequest.textContent = '⛔ 本周期配额已耗尽';
+    } else {
+      els.btnRequest.textContent = speaking ? '你正在发言中' : '🙋 申请发言';
+    }
   }
 }
 
@@ -960,11 +1130,13 @@ function renderPeople(snap) {
   for (const p of sorted) {
     const li = document.createElement('li');
     li.className = 'people-item';
+    li.dataset.id = p.id;
     li.innerHTML = `
       <span class="people-status ${p.online ? 'online' : 'offline'}"></span>
       <span class="people-nick ${p.online ? '' : 'offline-name'}">${escapeHtml(p.nick)}</span>
       ${p.id === snap.hostId ? '<span class="crown" title="主持人">👑</span>' : ''}
       ${state.me && p.id === state.me.id ? '<span class="me-tag">我</span>' : ''}
+      ${quotaTagHtml(snap, p.id)}
     `;
     els.peopleList.appendChild(li);
   }
@@ -984,6 +1156,21 @@ els.btnCancel.addEventListener('click', () => {
 
 els.btnEnd.addEventListener('click', () => {
   sendCmd({ type: 'end_speaking' });
+});
+
+// 累计发言配额：开启或重置为新周期（仍走版本守卫；旧周期定时回调不扣减新周期）
+els.btnQuotaReset.addEventListener('click', () => {
+  const minutes = chosenQuotaMin();
+  if (!minutes) {
+    toast('请先在「配额」下拉框选择 1～30 分钟', 'error');
+    return;
+  }
+  const snap = state.snapshot;
+  const msg = snap && snap.quota
+    ? `确定重置为新的配额周期？\n每人配额设为 ${minutes} 分钟，所有人本周期已用额度立即清零。\n（进行中的发言会转入新周期）`
+    : `确定开启累计发言配额？\n每人每周期 ${minutes} 分钟，按每轮实际发言时长扣减；\n额度用尽自动结束发言，且该成员需等待下个周期才能再次排队。`;
+  if (!confirm(msg)) return;
+  sendCmd({ type: 'quota_reset', minutes });
 });
 
 els.btnClearAll.addEventListener('click', () => {

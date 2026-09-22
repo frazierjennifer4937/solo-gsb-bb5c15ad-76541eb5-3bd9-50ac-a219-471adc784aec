@@ -14,6 +14,8 @@ const SPEAK_TIME_UNIT_MS = 50;
 const ROLLCALL_TIMEOUT_MS = 800;
 // 测试用：议题投票时长下限压缩为 1 秒，便于快速验证到期结算
 const TOPIC_MIN_SECONDS = 1;
+// 测试用：把累计配额的 1「分钟」压缩为 200ms，便于快速验证耗尽自动结束
+const QUOTA_UNIT_MS = 200;
 let failures = 0;
 let serverProc = null;
 
@@ -1378,6 +1380,188 @@ async function main() {
     await h.close(); await g1.close(); await g2.close(); await g3b.close();
   }
 
+  // ===========================================================================
+  // 累计发言配额（QUOTA_UNIT_MS=200ms：协议中的 1「分钟」= 200ms）
+  // ===========================================================================
+  {
+    const created = await createRoom('配额主持');
+    const h = await hostJoin(created);
+    const g1 = await guestJoin(created.room, '额甲');
+    const g2 = await guestJoin(created.room, '额乙');
+    const id1 = g1.joined.you.id;
+    const id2 = g2.joined.you.id;
+
+    await waitStable(h, [g1, g2]);
+
+    // 25a. 未开启时快照 quota 为 null；非主持人/非法分钟数/过期版本均被拒
+    assert.strictEqual(h.snapshot.quota, null, '初始无配额');
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'quota_reset', minutes: 2 });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'FORBIDDEN');
+    for (const bad of [0, 31, 1.5, 'abc']) {
+      const vBad = h.v;
+      h.lastError = null;
+      h.send({ type: 'quota_reset', version: h.v, minutes: bad });
+      await h.waitFor((c) => c.lastError && c.lastError.code === 'BAD_DURATION');
+      assert.strictEqual(h.v, vBad, '非法配额不得改变版本');
+    }
+    h.lastError = null;
+    h.send({ type: 'quota_reset', version: h.v - 1, minutes: 2 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'STALE_VERSION');
+    assert.strictEqual(h.snapshot.quota, null, '过期版本不得开启配额');
+
+    // 25b. 主持人开启配额（5 分钟 = 1000ms）：快照下发周期标识、额度、每人已用/剩余
+    h.send({ type: 'quota_reset', version: h.v, minutes: 5 });
+    await h.waitFor((c) => c.snapshot.quota && /^cy_/.test(c.snapshot.quota.cycleId));
+    let q = h.snapshot.quota;
+    const cycle1 = q.cycleId;
+    assert.strictEqual(q.limitMs, 5 * QUOTA_UNIT_MS);
+    assert.strictEqual(q.minutes, 5);
+    assert.strictEqual(q.used[id1], 0);
+    assert.strictEqual(q.remain[id1], 5 * QUOTA_UNIT_MS);
+    assert.strictEqual(q.used[id2], 0);
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'quota' && /开启累计发言配额/.test(l.text)));
+
+    // 25c. 按每轮实际发言时长扣减：讲约 250ms 后手动结束，已用≈250ms，剩余=额度-已用
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    assert.strictEqual(h.snapshot.speaking.id, id1);
+    await sleep(250);
+    await hostCmd(h, { type: 'end_speaking' });
+    q = h.snapshot.quota;
+    const used1 = q.used[id1];
+    assert.ok(used1 >= 200 && used1 <= 500, `第一轮扣减应约 250ms（used=${used1}ms）`);
+    const remain1 = q.remain[id1];
+    assert.ok(Math.abs(remain1 - (5 * QUOTA_UNIT_MS - used1)) < 5, '剩余 = 额度 - 已用');
+    assert.ok(remain1 > 0 && remain1 < 5 * QUOTA_UNIT_MS);
+
+    // 25d. 第二轮发言：剩余额度在本轮耗尽，服务端自动结束（不是手动）
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    const vBeforeExhaust = h.v;
+    await h.waitFor((c) => c.snapshot.speaking === null && c.v === vBeforeExhaust + 1, 3000,
+      '配额耗尽自动结束');
+    q = h.snapshot.quota;
+    assert.ok(q.used[id1] >= 5 * QUOTA_UNIT_MS - 30 && q.used[id1] <= 5 * QUOTA_UNIT_MS + 60,
+      `耗尽时已用应封顶到额度（used=${q.used[id1]}ms）`);
+    assert.strictEqual(q.remain[id1], 0, '剩余为 0');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'talk' && /配额已用尽，自动结束/.test(l.text)),
+      '耗尽自动结束应写入操作记录');
+
+    // 25e. 额度耗尽禁止再次排队：参与者申请 / 主持人请其发言都被拒
+    g1.lastError = null;
+    await guestSend(h, g1, { type: 'request_speak' });
+    await g1.waitFor((c) => c.lastError && c.lastError.code === 'QUOTA_EXHAUSTED');
+    assert.deepStrictEqual(h.snapshot.order, [], '耗尽者不得进入队列');
+    h.lastError = null;
+    h.send({ type: 'start_speaking', version: h.v, participantId: id1 });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'QUOTA_EXHAUSTED');
+    assert.strictEqual(h.snapshot.speaking, null, '主持人也不能请耗尽者发言');
+
+    // 25f. 重置新周期：周期标识变化、已用清零、耗尽者恢复可排队；
+    // 旧周期标识与新周期不同（旧回调不得扣减新周期）
+    h.lastError = null; // 清除 25e 中主持人的 QUOTA_EXHAUSTED 残留，避免提前返回
+    h.send({ type: 'quota_reset', version: h.v, minutes: 2 });
+    await h.waitFor((c) => c.snapshot.quota && c.snapshot.quota.cycleId !== cycle1);
+    q = h.snapshot.quota;
+    const cycle2 = q.cycleId;
+    assert.notStrictEqual(cycle2, cycle1);
+    assert.strictEqual(q.used[id1], 0, '新周期已用清零');
+    assert.strictEqual(q.remain[id1], 2 * QUOTA_UNIT_MS, '新周期余额恢复');
+    assert.ok(h.snapshot.logs.some((l) => l.kind === 'quota' && /重置发言配额周期/.test(l.text)));
+    // 等待 g1 收到重置后的快照（版本同步），再申请发言；若仍被版本守卫拦截，同步后重试一次
+    g1.lastError = null;
+    await waitStable(h, [g1]);
+    g1.send({ type: 'request_speak', version: g1.v });
+    await h.waitFor((c) => c.snapshot.order.length === 1 || (g1.lastError && g1.lastError.code === 'STALE_VERSION'),
+      2000, '重置后耗尽者排队（首次）');
+    if (h.snapshot.order.length !== 1) {
+      g1.lastError = null;
+      await waitStable(h, [g1]);
+      g1.send({ type: 'request_speak', version: g1.v });
+      await h.waitFor((c) => c.snapshot.order.length === 1, 2000, '重置后耗尽者排队（重试）');
+    }
+
+    // 25g. 手动结束与到期回调竞争只结算一次：开始一轮短于配额的发言，
+    // 讲到一半手动结束，之后版本不得再增长，已用不再变化
+    assert.strictEqual(h.snapshot.speaking, null, '此时无人发言');
+    await hostCmd(h, { type: 'start_speaking', participantId: id1 });
+    await sleep(120);
+    await hostCmd(h, { type: 'end_speaking' });
+    const usedAfterManual = h.snapshot.quota.used[id1];
+    const vManual = h.v;
+    await sleep(2 * QUOTA_UNIT_MS + 400); // 远超耗尽点
+    assert.strictEqual(h.v, vManual, '手动结束后旧到期回调不得再次结算/产生版本');
+    assert.strictEqual(h.snapshot.quota.used[id1], usedAfterManual, '旧回调不得重复扣减');
+
+    // 25h. 不同成员配额独立：id2 的余额完全不受 id1 影响
+    q = h.snapshot.quota;
+    assert.strictEqual(q.used[id2], 0, '其他成员余额独立');
+    assert.strictEqual(q.remain[id2], 2 * QUOTA_UNIT_MS);
+    // 25i. 重置新周期时进行中的发言转入新周期：重置不打断发言人，
+    // 且在新周期额度耗尽点才自动结束（按新的 400ms 满额扣减）
+    await hostCmd(h, { type: 'start_speaking', participantId: id2 });
+    await sleep(120);
+    h.lastError = null;
+    h.send({ type: 'quota_reset', version: h.v, minutes: 2 });
+    await h.waitFor((c) => c.snapshot.quota && c.snapshot.quota.cycleId !== cycle2);
+    const cycle3 = h.snapshot.quota.cycleId;
+    assert.strictEqual(h.snapshot.speaking.id, id2, '重置不打断当前发言人');
+    assert.strictEqual(h.snapshot.speaking.quotaCycleId, undefined, '快照不直接下发内部字段');
+    assert.strictEqual(h.snapshot.quota.used[id2], 0, '转入新周期后 id2 已用从 0 起算');
+    // 旧周期若有回调（id2 是重置后才开始，本无旧回调；这里验证新周期计时完整）
+    const vReset = h.v;
+    // 在新周期中发言应持续约 400ms 才被自动结束
+    await h.waitFor((c) => c.snapshot.speaking === null && c.v === vReset + 1,
+      3 * QUOTA_UNIT_MS + 1500, '转入新周期后按新额度耗尽');
+    assert.ok(h.snapshot.quota.used[id2] >= 2 * QUOTA_UNIT_MS - 30,
+      `新周期按满额扣减（used=${h.snapshot.quota.used[id2]}ms）`);
+    assert.strictEqual(h.snapshot.quota.cycleId, cycle3);
+
+    // 25j. 本轮限时（durationMin）与配额同时存在时，取较早结束点：
+    // 配额 3「分钟」=600ms，本轮限时 1「分钟」=50ms -> 50ms 后按「时间到」结束
+    h.lastError = null;
+    h.send({ type: 'quota_reset', version: h.v, minutes: 3 });
+    await h.waitFor((c) => c.snapshot.quota && c.snapshot.quota.cycleId !== cycle3);
+    await guestSend(h, g1, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'start_speaking', participantId: id1, durationMin: 1 });
+    const vShort = h.v;
+    await h.waitFor((c) => c.snapshot.speaking === null && c.v === vShort + 1, 2000);
+    assert.ok(h.snapshot.logs.some((l) => /时间到，自动结束/.test(l.text)),
+      '本轮限时先到应记为时间到');
+    const usedShort = h.snapshot.quota.used[id1];
+    assert.ok(usedShort >= 30 && usedShort < 150, `限时结束按实际时长扣减（used=${usedShort}ms）`);
+    assert.ok(h.snapshot.quota.remain[id1] > 0, '限时结束后配额仍有剩余');
+
+    // 25k. 断线重连后继续显示真实余额（快照中的已用/剩余连续）
+    const remainBefore = h.snapshot.quota.remain[id1];
+    await g1.close();
+    const g1b = new Client();
+    await g1b.open();
+    g1b.send({ type: 'join', room: created.room, nick: '额甲', participantId: id1, secret: g1.joined.you.secret });
+    await g1b.waitFor((c) => c.joined && c.joined.you.id === id1);
+    assert.ok(g1b.snapshot.quota, '重连后配额状态恢复');
+    assert.strictEqual(g1b.snapshot.quota.cycleId, h.snapshot.quota.cycleId, '重连后周期标识一致');
+    assert.strictEqual(g1b.snapshot.quota.used[id1], h.snapshot.quota.used[id1], '重连后已用一致');
+    assert.ok(Math.abs(g1b.snapshot.quota.remain[id1] - remainBefore) < 1000, '重连后剩余余额连续');
+
+    // 25l. 重置配额同样走版本守卫并使挂起撤销失效
+    await guestSend(h, g2, { type: 'request_speak' });
+    await h.waitFor((c) => c.snapshot.order.length === 1);
+    await hostCmd(h, { type: 'remove', participantId: id2 });
+    await waitForUndo(h, (u) => u.status === 'available' && u.op === 'remove');
+    h.lastError = null;
+    h.send({ type: 'quota_reset', version: h.v, minutes: 1 });
+    await h.waitFor((c) => c.snapshot.undo && c.snapshot.undo.status === 'invalid');
+    assert.strictEqual(h.snapshot.undo.reason, 'quota_changed');
+    h.lastError = null;
+    h.send({ type: 'undo_host', version: h.v });
+    await h.waitFor((c) => c.lastError && c.lastError.code === 'UNDO_INVALIDATED');
+
+    await h.close(); await g1b.close(); await g2.close();
+  }
+
   // 15. 房间不存在
   const ghost = new Client();
   await ghost.open();
@@ -1395,7 +1579,7 @@ async function main() {
 function startServer() {
   return new Promise((resolve, reject) => {
     serverProc = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS), TOPIC_MIN_SECONDS: String(TOPIC_MIN_SECONDS) },
+      env: { ...process.env, PORT: TEST_PORT, SPEAK_TIME_UNIT_MS: String(SPEAK_TIME_UNIT_MS), ROLLCALL_TIMEOUT_MS: String(ROLLCALL_TIMEOUT_MS), TOPIC_MIN_SECONDS: String(TOPIC_MIN_SECONDS), QUOTA_UNIT_MS: String(QUOTA_UNIT_MS) },
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let settled = false;
